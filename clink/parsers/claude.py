@@ -95,6 +95,9 @@ class ClaudeJSONParser(BaseParser):
         api_duration = payload.get("duration_api_ms")
         if isinstance(api_duration, (int, float)):
             metadata["duration_api_ms"] = api_duration
+        total_cost = payload.get("total_cost_usd")
+        if isinstance(total_cost, (int, float)):
+            metadata["total_cost_usd"] = total_cost
 
         usage = payload.get("usage")
         if isinstance(usage, dict):
@@ -103,8 +106,7 @@ class ClaudeJSONParser(BaseParser):
         model_usage = payload.get("modelUsage")
         if isinstance(model_usage, dict) and model_usage:
             metadata["model_usage"] = model_usage
-            first_model = next(iter(model_usage.keys()))
-            metadata["model_used"] = first_model
+            metadata["model_used"] = self._select_primary_model(model_usage, usage)
 
         permission_denials = payload.get("permission_denials")
         if isinstance(permission_denials, list) and permission_denials:
@@ -122,6 +124,48 @@ class ClaudeJSONParser(BaseParser):
             metadata.setdefault("stderr", stderr_text)
 
         return metadata
+
+    @staticmethod
+    def _select_primary_model(
+        model_usage: dict[str, Any],
+        usage: dict[str, Any] | None,
+    ) -> str:
+        """Select the model responsible for the top-level Claude CLI result."""
+        token_fields = (
+            ("inputTokens", "input_tokens"),
+            ("outputTokens", "output_tokens"),
+            ("cacheReadInputTokens", "cache_read_input_tokens"),
+            ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+        )
+        if isinstance(usage, dict):
+            exact_matches: list[str] = []
+            for model_name, model_metrics in model_usage.items():
+                if not isinstance(model_metrics, dict):
+                    continue
+                comparable = [
+                    (model_metrics[model_key], usage[usage_key])
+                    for model_key, usage_key in token_fields
+                    if isinstance(model_metrics.get(model_key), (int, float))
+                    and isinstance(usage.get(usage_key), (int, float))
+                ]
+                if comparable and all(model_value == usage_value for model_value, usage_value in comparable):
+                    exact_matches.append(model_name)
+            if len(exact_matches) == 1:
+                return exact_matches[0]
+
+        cost_ranked = sorted(
+            (
+                (model_metrics.get("costUSD"), model_name)
+                for model_name, model_metrics in model_usage.items()
+                if isinstance(model_metrics, dict)
+                and isinstance(model_metrics.get("costUSD"), (int, float))
+            ),
+            reverse=True,
+        )
+        if cost_ranked and (len(cost_ranked) == 1 or cost_ranked[0][0] > cost_ranked[1][0]):
+            return cost_ranked[0][1]
+
+        return next(iter(model_usage))
 
     def _extract_message(self, payload: dict[str, Any]) -> str | None:
         message = payload.get("message")

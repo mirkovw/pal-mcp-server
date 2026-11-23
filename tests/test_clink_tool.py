@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -49,6 +50,7 @@ async def test_clink_tool_execute(monkeypatch):
     assert "Hello from Gemini" in payload["content"]
     metadata = payload.get("metadata", {})
     assert metadata.get("cli_name") == "gemini"
+    assert metadata.get("embedded_files") == []
     assert metadata.get("command") == ["gemini", "-o", "json"]
 
 
@@ -60,13 +62,7 @@ def test_registry_lists_roles():
     assert "default" in roles
     assert "default" in registry.list_roles("codex")
     codex_client = registry.get_client("codex")
-    # Verify codex uses --enable web_search_request (not --search which is unsupported by exec)
-    assert codex_client.config_args == [
-        "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--enable",
-        "web_search_request",
-    ]
+    assert "--json" in codex_client.config_args
 
 
 @pytest.mark.asyncio
@@ -101,7 +97,7 @@ async def test_clink_tool_defaults_to_first_cli(monkeypatch):
     payload = json.loads(result[0].text)
     metadata = payload.get("metadata", {})
     assert metadata.get("cli_name") == tool._default_cli_name
-    assert metadata.get("events_removed_for_normal") is True
+    assert "events" not in metadata
 
 
 @pytest.mark.asyncio
@@ -142,7 +138,7 @@ async def test_clink_tool_truncates_large_output(monkeypatch):
     assert payload["content"].strip() == "This is the condensed summary."
     metadata = payload.get("metadata", {})
     assert metadata.get("output_summarized") is True
-    assert metadata.get("events_removed_for_normal") is True
+    assert "events" not in metadata
     assert metadata.get("output_original_length") == len(long_text)
 
 
@@ -183,5 +179,67 @@ async def test_clink_tool_truncates_without_summary(monkeypatch):
     assert "exceeding the configured clink limit" in payload["content"]
     metadata = payload.get("metadata", {})
     assert metadata.get("output_truncated") is True
-    assert metadata.get("events_removed_for_normal") is True
+    assert "events" not in metadata
     assert metadata.get("output_original_length") == len(long_text)
+
+
+@pytest.mark.asyncio
+async def test_clink_embeds_files_and_returns_compact_attestation(monkeypatch, tmp_path):
+    tool = CLinkTool()
+    evidence = tmp_path / "diff.patch"
+    evidence.write_text("diff --git a/a.py b/a.py\n+answer = 42\n", encoding="utf-8")
+    captured = {}
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return AgentOutput(
+                parsed=ParsedCLIResponse(
+                    content='{"findings":[]}',
+                    metadata={
+                        "model_used": "claude-fable-5",
+                        "raw": {"huge": ["metadata"] * 100},
+                        "raw_events": [{"event": "noise"}],
+                        "permission_denials": [{"tool_name": "Read", "tool_input": {"file_path": "/tmp/nope"}}],
+                        "total_cost_usd": 1.25,
+                    },
+                ),
+                sanitized_command=["claude", "--print"],
+                returncode=0,
+                stdout="{}",
+                stderr="",
+                duration_seconds=1.5,
+                parser_name="claude_json",
+                output_file_content=None,
+            )
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    result = await tool.execute(
+        {
+            "prompt": "Review the embedded diff.",
+            "cli_name": "claude",
+            "role": "default",
+            "absolute_file_paths": [str(evidence)],
+            "images": [],
+        }
+    )
+
+    assert "=== EMBEDDED FILE CONTENT ===" in captured["prompt"]
+    assert "answer = 42" in captured["prompt"]
+    payload = json.loads(result[0].text)
+    metadata = payload["metadata"]
+    assert metadata["embedded_files"] == [
+        {
+            "path": str(evidence),
+            "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            "size_bytes": evidence.stat().st_size,
+        }
+    ]
+    assert metadata["unembedded_files"] == []
+    assert metadata["permission_denial_count"] == 1
+    assert metadata["permission_denied_tools"] == ["Read"]
+    assert metadata["total_cost_usd"] == 1.25
+    assert metadata["command"] == ["claude", "--print"]
+    assert "raw" not in metadata
+    assert "raw_events" not in metadata

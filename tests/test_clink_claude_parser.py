@@ -27,6 +27,43 @@ def test_claude_parser_extracts_result_and_metadata():
     assert parsed.metadata["model_used"] == "claude-sonnet-4-5-20250929"
     assert parsed.metadata["usage"]["output_tokens"] == 5
     assert parsed.metadata["is_error"] is False
+    assert parsed.metadata["total_cost_usd"] == 0.12
+
+
+def test_claude_parser_selects_primary_model_when_helper_usage_comes_first():
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "result": "OK",
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 3118,
+            },
+            "modelUsage": {
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 520,
+                    "outputTokens": 11,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                    "costUSD": 0.000575,
+                },
+                "claude-fable-5": {
+                    "inputTokens": 2,
+                    "outputTokens": 4,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 3118,
+                    "costUSD": 0.06258,
+                },
+            },
+        }
+    )
+
+    parsed = ClaudeJSONParser().parse(stdout, "")
+
+    assert parsed.metadata["model_used"] == "claude-fable-5"
 
 
 def test_claude_parser_falls_back_to_message():
